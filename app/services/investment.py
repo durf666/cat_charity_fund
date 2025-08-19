@@ -1,9 +1,6 @@
 from datetime import datetime
 from typing import Iterable
 
-from sqlalchemy import asc, select
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.models.charity_project import CharityProject
 from app.models.donation import Donation
 
@@ -12,27 +9,26 @@ def now_truncated_to_seconds() -> datetime:
     return datetime.now().replace(microsecond=0)
 
 
-async def allocate_donations_to_project(
-    session: AsyncSession,
+def allocate_donations_to_project(
     project: CharityProject,
+    donations: Iterable[Donation],
 ) -> None:
     if project.fully_invested:
         return
+    # Coalesce possibly None invested_amount before first commit
+    if project.invested_amount is None:
+        project.invested_amount = 0
     needed = project.full_amount - project.invested_amount
     if needed <= 0:
         project.fully_invested = True
         project.close_date = now_truncated_to_seconds()
         return
 
-    result = await session.execute(
-        select(Donation)
-        .where(Donation.fully_invested.is_(False))
-        .order_by(asc(Donation.create_date), asc(Donation.id))
-    )
-    donations: Iterable[Donation] = result.scalars().all()
     for donation in donations:
         if needed <= 0:
             break
+        if donation.invested_amount is None:
+            donation.invested_amount = 0
         available = donation.full_amount - donation.invested_amount
         if available <= 0:
             continue
@@ -50,27 +46,25 @@ async def allocate_donations_to_project(
         project.close_date = now_truncated_to_seconds()
 
 
-async def allocate_projects_for_donation(
-    session: AsyncSession,
+def allocate_projects_for_donation(
     donation: Donation,
+    projects: Iterable[CharityProject],
 ) -> None:
     if donation.fully_invested:
         return
+    if donation.invested_amount is None:
+        donation.invested_amount = 0
     available = donation.full_amount - donation.invested_amount
     if available <= 0:
         donation.fully_invested = True
         donation.close_date = now_truncated_to_seconds()
         return
 
-    result = await session.execute(
-        select(CharityProject)
-        .where(CharityProject.fully_invested.is_(False))
-        .order_by(asc(CharityProject.create_date), asc(CharityProject.id))
-    )
-    projects: Iterable[CharityProject] = result.scalars().all()
     for project in projects:
         if available <= 0:
             break
+        if project.invested_amount is None:
+            project.invested_amount = 0
         needed = project.full_amount - project.invested_amount
         if needed <= 0:
             continue

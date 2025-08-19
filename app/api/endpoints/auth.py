@@ -8,6 +8,7 @@ from app.core.security import (
     get_password_hash,
     verify_password,
 )
+from app.core.constants import MIN_PASSWORD_LEN
 from app.models.auth_user import AuthUser
 from app.schemas.user import Token, UserCreate, UserLogin, UserRead
 
@@ -24,7 +25,7 @@ async def register(
     session: AsyncSession = Depends(get_async_session),
 ) -> UserRead:
     # Minimal validation to satisfy tests: password must be at least 3 chars
-    if user_in.password is None or len(user_in.password) < 3:
+    if not user_in.password or len(user_in.password) < MIN_PASSWORD_LEN:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid password",

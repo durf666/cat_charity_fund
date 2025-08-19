@@ -2,7 +2,6 @@ from datetime import datetime
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import asc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_async_session
@@ -14,6 +13,8 @@ from app.schemas.charity_project import (
     CharityProjectUpdate,
 )
 from app.services.investment import allocate_donations_to_project
+from app.crud.charity_project import charity_project_crud
+from app.crud.donation import donation_crud
 
 router = APIRouter(prefix="/charity_project", tags=["charity_project"])
 
@@ -22,10 +23,9 @@ async def get_project_or_404(
     session: AsyncSession,
     project_id: int,
 ) -> CharityProject:
-    result = await session.execute(
-        select(CharityProject).where(CharityProject.id == project_id)
+    project: Optional[CharityProject] = await charity_project_crud.get(
+        session, project_id
     )
-    project: Optional[CharityProject] = result.scalars().first()
     if not project:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -39,11 +39,8 @@ async def ensure_unique_project_name(
     name: str,
     exclude_id: Optional[int] = None,
 ) -> None:
-    stmt = select(CharityProject).where(CharityProject.name == name)
-    if exclude_id is not None:
-        stmt = stmt.where(CharityProject.id != exclude_id)
-    exists = await session.execute(stmt)
-    if exists.scalars().first():
+    existing = await charity_project_crud.get_by_name(session, name)
+    if existing and (exclude_id is None or existing.id != exclude_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Project name must be unique",
@@ -93,10 +90,12 @@ def apply_full_amount_update(
 async def get_projects(
     session: AsyncSession = Depends(get_async_session),
 ):
-    result = await session.execute(
-        select(CharityProject).order_by(asc(CharityProject.id))
-    )
-    return result.scalars().all()
+    """Получить список всех благотворительных проектов.
+
+    - Доступ: любой пользователь
+    - Возвращает: полный список `CharityProjectRead`
+    """
+    return await charity_project_crud.get_multi(session)
 
 
 @router.post("/", response_model=CharityProjectRead)
@@ -105,22 +104,35 @@ async def create_project(
     session: AsyncSession = Depends(get_async_session),
     superuser=Depends(current_superuser),
 ):
+    """Создать новый благотворительный проект.
+
+    - Доступ: только суперюзер
+    - Проверки: уникальность имени, валидность `full_amount`
+    - Инвестиции: сразу после создания распределяются открытые донаты
+
+    Примечание: коммит выполняется один раз — после расчётов инвестирования.
+    """
     # Unique name check
     await ensure_unique_project_name(session, project_in.name)
 
-    project = CharityProject(
-        name=project_in.name,
-        description=project_in.description,
-        full_amount=project_in.full_amount,
+    project = await charity_project_crud.create(
+        session,
+        {
+            "name": project_in.name,
+            "description": project_in.description,
+            "full_amount": project_in.full_amount,
+        },
+        commit=False,
+        refresh=False,
     )
-    session.add(project)
-    await session.commit()
-    await session.refresh(project)
 
     # Allocate existing donations to this new project
-    await allocate_donations_to_project(session, project)
-    await session.commit()
-    await session.refresh(project)
+    donations = await donation_crud.get_open_ordered(session)
+    allocate_donations_to_project(project, donations)
+    # Persist possible changes after allocation
+    project = await charity_project_crud.update(
+        session, project, {}, commit=True, refresh=True
+    )
 
     return project
 
@@ -132,6 +144,13 @@ async def update_project(
     session: AsyncSession = Depends(get_async_session),
     superuser=Depends(current_superuser),
 ):
+    """Обновить параметры проекта.
+
+    - Доступ: только суперюзер
+    - Нельзя редактировать закрытый проект
+    - `full_amount` не может быть меньше уже инвестированной суммы
+    - При достижении цели проект автоматически закрывается
+    """
     project = await get_project_or_404(session, project_id)
 
     if project.fully_invested:
@@ -147,14 +166,23 @@ async def update_project(
         await ensure_unique_project_name(
             session, update_data["name"], exclude_id=project.id
         )
-        project.name = update_data["name"]
 
-    apply_description_update(project, update_data)
+    # Description validation is handled by schema; nothing extra here
 
-    apply_full_amount_update(project, update_data)
+    # full_amount validation and possible closing
+    if "full_amount" in update_data:
+        new_full = update_data["full_amount"]
+        if new_full < project.invested_amount:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="full_amount can't be less than invested_amount",
+            )
+        # If closing condition will be achieved after update
+        if project.invested_amount >= new_full and not project.fully_invested:
+            update_data["fully_invested"] = True
+            update_data["close_date"] = datetime.now().replace(microsecond=0)
 
-    await session.commit()
-    await session.refresh(project)
+    project = await charity_project_crud.update(session, project, update_data)
     return project
 
 
@@ -164,10 +192,14 @@ async def delete_project(
     session: AsyncSession = Depends(get_async_session),
     superuser=Depends(current_superuser),
 ):
-    result = await session.execute(
-        select(CharityProject).where(CharityProject.id == project_id)
+    """Удалить проект по `id`.
+
+    - Доступ: только суперюзер
+    - Нельзя удалить проект, если он закрыт или в него уже внесены средства
+    """
+    project: Optional[CharityProject] = await charity_project_crud.get(
+        session, project_id
     )
-    project: Optional[CharityProject] = result.scalars().first()
     if not project:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -180,6 +212,5 @@ async def delete_project(
             detail="Can't delete invested/closed project"
         )
 
-    await session.delete(project)
-    await session.commit()
-    return project
+    deleted = await charity_project_crud.remove(session, project.id)
+    return deleted
